@@ -2404,6 +2404,73 @@ mod tests {
             .collect()
     }
 
+    #[gpui::test]
+    async fn test_unauthenticated_user_blocked_without_custom_url(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = project::FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let buffer = cx.new(|cx| Buffer::local("fn main() {}", cx));
+
+        let (zeta, _, _) = make_test_zeta(&project, cx).await;
+
+        zeta.update(cx, |zeta, cx| {
+            zeta.user_store.update(cx, |user_store, _cx| {
+                user_store.clear_user();
+            });
+        });
+
+        std::env::remove_var("ZED_PREDICT_EDITS_URL");
+
+        let cursor = buffer.read_with(cx, |buffer, _| buffer.anchor_before(Point::new(0, 0)));
+        let completion_task = zeta.update(cx, |zeta, cx| {
+            zeta.request_completion(&project, &buffer, cursor, cx)
+        });
+
+        match completion_task.await {
+            Err(_) => {},
+            _ => panic!("Expected error for unauthenticated user without custom URL"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_unauthenticated_user_with_custom_url_succeeds(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = project::FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let buffer = cx.new(|cx| Buffer::local("fn main() {}", cx));
+
+        let (zeta, _, _) = make_test_zeta(&project, cx).await;
+
+        zeta.update(cx, |zeta, cx| {
+            zeta.user_store.update(cx, |user_store, _cx| {
+                user_store.clear_user();
+            });
+        });
+
+        std::env::set_var("ZED_PREDICT_EDITS_URL", "http://custom-api.example.com/predict");
+
+        let cursor = buffer.read_with(cx, |buffer, _| buffer.anchor_before(Point::new(0, 0)));
+        let _edit_prediction = run_edit_prediction(&buffer, &project, &zeta, cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_authenticated_user_can_request_predictions(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = project::FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let buffer = cx.new(|cx| Buffer::local("fn main() {}", cx));
+
+        let (zeta, _, _) = make_test_zeta(&project, cx).await;
+
+        std::env::remove_var("ZED_PREDICT_EDITS_URL");
+
+        let cursor = buffer.read_with(cx, |buffer, _| buffer.anchor_before(Point::new(0, 0)));
+        let _edit_prediction = run_edit_prediction(&buffer, &project, &zeta, cx).await;
+    }
+
     #[ctor::ctor]
     fn init_logger() {
         zlog::init_test();
