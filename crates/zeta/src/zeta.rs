@@ -582,7 +582,12 @@ impl Zeta {
             } = params;
 
             let http_client = client.http_client();
-            let mut token = llm_token.acquire(&client).await?;
+            let use_custom_url = std::env::var("ZED_PREDICT_EDITS_URL").is_ok();
+            let mut token = if use_custom_url {
+                None
+            } else {
+                Some(llm_token.acquire(&client).await?)
+            };
             let mut did_retry = false;
 
             loop {
@@ -597,9 +602,14 @@ impl Zeta {
                                 .as_ref(),
                         )
                     };
+                let mut request_builder = request_builder
+                    .header("Content-Type", "application/json");
+
+                if let Some(ref token) = token {
+                    request_builder = request_builder.header("Authorization", format!("Bearer {}", token));
+                }
+
                 let request = request_builder
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", format!("Bearer {}", token))
                     .header(ZED_VERSION_HEADER_NAME, app_version.to_string())
                     .body(serde_json::to_string(&body)?.into())?;
 
@@ -625,13 +635,14 @@ impl Zeta {
                     response.body_mut().read_to_string(&mut body).await?;
                     return Ok((serde_json::from_str(&body)?, usage));
                 } else if !did_retry
+                    && token.is_some()
                     && response
                         .headers()
                         .get(EXPIRED_LLM_TOKEN_HEADER_NAME)
                         .is_some()
                 {
                     did_retry = true;
-                    token = llm_token.refresh(&client).await?;
+                    token = Some(llm_token.refresh(&client).await?);
                 } else {
                     let mut body = String::new();
                     response.body_mut().read_to_string(&mut body).await?;
