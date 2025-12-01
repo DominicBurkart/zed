@@ -203,7 +203,9 @@ fn assign_edit_prediction_provider(
             editor.set_edit_prediction_provider(Some(provider), window, cx);
         }
         EditPredictionProvider::Zed => {
-            if user_store.read(cx).current_user().is_some() {
+            if user_store.read(cx).current_user().is_some()
+                || std::env::var("ZED_PREDICT_EDITS_URL").is_ok()
+            {
                 let mut worktree = None;
 
                 if let Some(buffer) = &singleton_buffer
