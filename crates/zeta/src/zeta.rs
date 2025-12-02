@@ -3936,4 +3936,439 @@ mod tests {
             )
         })
     }
+
+    #[gpui::test]
+    async fn test_unauthenticated_without_custom_url_blocks_prediction(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            zlog::init_test();
+
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let http_client = FakeHttpClient::create({
+                let requests = requests.clone();
+                move |req| {
+                    let uri_path = req.uri().path().to_string();
+                    let has_auth = req.headers().get("Authorization").is_some();
+                    requests
+                        .lock()
+                        .push((uri_path.clone(), req.method().clone(), has_auth));
+                    async move {
+                        match uri_path.as_str() {
+                            "/client/llm_tokens" => Ok(Response::builder()
+                                .status(401)
+                                .body("Unauthorized".into())
+                                .unwrap()),
+                            _ => Ok(Response::builder()
+                                .status(401)
+                                .body("Unauthorized".into())
+                                .unwrap()),
+                        }
+                    }
+                }
+            });
+
+            let client = client::Client::new(Arc::new(FakeSystemClock::new()), http_client, cx);
+            // Do NOT set credentials - this is an unauthenticated client
+
+            language_model::init(client.clone(), cx);
+
+            let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+            let zeta = Zeta::global(&client, &user_store, cx);
+
+            let fs = FakeFs::new(cx.executor());
+            cx.executor().run_until_parked();
+            let _project = cx.background_executor().block(async {
+                fs.insert_tree(
+                    "/root",
+                    json!({
+                        "foo.md": "Hello!\nHow\nBye\n"
+                    }),
+                )
+                .await;
+                Project::test(fs, vec![path!("/root").as_ref()], cx).await
+            });
+
+            let buffer = _project
+                .update(cx, |project, cx| {
+                    let path = project.find_project_path(path!("root/foo.md"), cx).unwrap();
+                    project.open_buffer(path, cx)
+                });
+
+            let buffer = cx.executor().block(buffer).unwrap();
+            let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+            let position = snapshot.anchor_before(language::Point::new(1, 3));
+
+            let prediction_task = zeta.update(cx, |zeta, cx| {
+                zeta.request_prediction(&_project, &buffer, position, Default::default(), cx)
+            });
+
+            // Wait for the request to complete
+            let result = cx.executor().block(prediction_task);
+
+            // The prediction should fail due to missing authentication
+            // Either it returns an error, or returns None, or returns an empty result
+            assert!(
+                result.is_err() || result.unwrap().is_none(),
+                "Unauthenticated request without custom URL should fail"
+            );
+
+            // Verify no successful token acquisition happened
+            let requests = requests.lock();
+            let token_requests: Vec<_> = requests
+                .iter()
+                .filter(|(path, _, _)| path == "/client/llm_tokens")
+                .collect();
+            // We may have attempted to get a token but it should have failed
+            if !token_requests.is_empty() {
+                // If we tried to get a token, it should not have been authorized
+                assert!(
+                    token_requests.iter().all(|(_, _, has_auth)| !has_auth),
+                    "Token requests should not have been authorized"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_unauthenticated_with_custom_url_allows_prediction(cx: &mut TestAppContext) {
+        unsafe {
+            std::env::set_var("ZED_PREDICT_EDITS_URL", "http://localhost:8080/predict");
+        }
+
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            zlog::init_test();
+
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let http_client = FakeHttpClient::create({
+                let requests = requests.clone();
+                move |req| {
+                    let uri = req.uri().clone();
+                    let uri_path = uri.path().to_string();
+                    let has_auth = req.headers().get("Authorization").is_some();
+                    requests.lock().push((
+                        uri_path.clone(),
+                        req.method().clone(),
+                        has_auth,
+                        uri.to_string(),
+                    ));
+
+                    async move {
+                        match uri_path.as_str() {
+                            "/predict" => Ok(Response::builder()
+                                .body(
+                                    serde_json::to_string(&model_response(indoc! {r"
+                                        --- a/root/foo.md
+                                        +++ b/root/foo.md
+                                        @@ ... @@
+                                         Hello!
+                                        -How
+                                        +How are you?
+                                         Bye
+                                    "}))
+                                    .unwrap()
+                                    .into(),
+                                )
+                                .unwrap()),
+                            "/client/llm_tokens" => {
+                                // Should not be called when using custom URL
+                                panic!("Should not try to acquire token with custom URL")
+                            }
+                            _ => Ok(Response::builder()
+                                .status(404)
+                                .body("Not found".into())
+                                .unwrap()),
+                        }
+                    }
+                }
+            });
+
+            let client = client::Client::new(Arc::new(FakeSystemClock::new()), http_client, cx);
+            // Do NOT set credentials - this is an unauthenticated client
+
+            language_model::init(client.clone(), cx);
+
+            let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+            let zeta = Zeta::global(&client, &user_store, cx);
+
+            let fs = FakeFs::new(cx.executor());
+            cx.executor().run_until_parked();
+            let _project = cx.background_executor().block(async {
+                fs.insert_tree(
+                    "/root",
+                    json!({
+                        "foo.md": "Hello!\nHow\nBye\n"
+                    }),
+                )
+                .await;
+                Project::test(fs, vec![path!("/root").as_ref()], cx).await
+            });
+
+            let buffer = _project
+                .update(cx, |project, cx| {
+                    let path = project.find_project_path(path!("root/foo.md"), cx).unwrap();
+                    project.open_buffer(path, cx)
+                });
+
+            let buffer = cx.executor().block(buffer).unwrap();
+            let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+            let position = snapshot.anchor_before(language::Point::new(1, 3));
+
+            let prediction_task = zeta.update(cx, |zeta, cx| {
+                zeta.request_prediction(&_project, &buffer, position, Default::default(), cx)
+            });
+
+            // Wait for the request to complete
+            let result = cx.executor().block(prediction_task);
+
+            // The prediction should succeed using custom URL
+            assert!(
+                result.is_ok(),
+                "Unauthenticated request with custom URL should succeed, got: {:?}",
+                result.err()
+            );
+
+            let requests = requests.lock();
+
+            // Verify NO token acquisition happened
+            let token_requests: Vec<_> = requests
+                .iter()
+                .filter(|(path, _, _, _)| path == "/client/llm_tokens")
+                .collect();
+            assert_eq!(
+                token_requests.len(),
+                0,
+                "Should not attempt token acquisition with custom URL"
+            );
+
+            // Verify the prediction request went to custom URL
+            let predict_requests: Vec<_> = requests
+                .iter()
+                .filter(|(path, _, _, _)| path == "/predict")
+                .collect();
+            assert_eq!(
+                predict_requests.len(),
+                1,
+                "Should have made exactly one prediction request"
+            );
+
+            // Verify NO Authorization header on prediction request
+            let (_, _, has_auth, url) = &predict_requests[0];
+            assert!(
+                !has_auth,
+                "Prediction request should not have Authorization header"
+            );
+            assert!(
+                url.contains("localhost:8080"),
+                "Should use custom URL, got: {}",
+                url
+            );
+        });
+
+        // Cleanup
+        std::env::remove_var("ZED_PREDICT_EDITS_URL");
+    }
+
+    #[gpui::test]
+    async fn test_authenticated_without_custom_url_uses_token(cx: &mut TestAppContext) {
+        let (zeta, mut requests) = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "foo.md": "Hello!\nHow\nBye\n"
+            }),
+        )
+        .await;
+        let project = Project::test(fs, vec![path!("/root").as_ref()], cx).await;
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path(path!("root/foo.md"), cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let position = snapshot.anchor_before(language::Point::new(1, 3));
+
+        let prediction_task = zeta.update(cx, |zeta, cx| {
+            zeta.request_prediction(&project, &buffer, position, Default::default(), cx)
+        });
+
+        // Wait for and respond to the prediction request
+        let (_, respond_tx) = requests.predict.next().await.unwrap();
+        respond_tx
+            .send(model_response(indoc! { r"
+                --- a/root/foo.md
+                +++ b/root/foo.md
+                @@ ... @@
+                 Hello!
+                -How
+                +How are you?
+                 Bye
+            "}))
+            .unwrap();
+
+        let result = prediction_task.await;
+
+        // The prediction should succeed
+        assert!(
+            result.is_ok() && result.unwrap().is_some(),
+            "Authenticated request should succeed"
+        );
+
+        // Note: The init_test helper sets up the HTTP client to respond to /client/llm_tokens
+        // and /predict_edits/raw, so by successfully completing the prediction,
+        // we've implicitly verified:
+        // 1. Token was acquired (init_test's HTTP client handles /client/llm_tokens)
+        // 2. Authorization header was present (the fake client returns success)
+        // 3. Default Zed endpoint was used (/predict_edits/raw)
+    }
+
+    #[gpui::test]
+    async fn test_authenticated_with_custom_url_skips_token(cx: &mut TestAppContext) {
+        unsafe {
+            std::env::set_var("ZED_PREDICT_EDITS_URL", "http://localhost:8080/predict");
+        }
+
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            zlog::init_test();
+
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let http_client = FakeHttpClient::create({
+                let requests = requests.clone();
+                move |req| {
+                    let uri = req.uri().clone();
+                    let uri_path = uri.path().to_string();
+                    let has_auth = req.headers().get("Authorization").is_some();
+                    requests.lock().push((
+                        uri_path.clone(),
+                        req.method().clone(),
+                        has_auth,
+                        uri.to_string(),
+                    ));
+
+                    async move {
+                        match uri_path.as_str() {
+                            "/predict" => Ok(Response::builder()
+                                .body(
+                                    serde_json::to_string(&model_response(indoc! {r"
+                                        --- a/root/foo.md
+                                        +++ b/root/foo.md
+                                        @@ ... @@
+                                         Hello!
+                                        -How
+                                        +How are you?
+                                         Bye
+                                    "}))
+                                    .unwrap()
+                                    .into(),
+                                )
+                                .unwrap()),
+                            "/client/llm_tokens" => {
+                                // Should not be called when using custom URL
+                                panic!("Should not try to acquire token with custom URL")
+                            }
+                            _ => Ok(Response::builder()
+                                .status(404)
+                                .body("Not found".into())
+                                .unwrap()),
+                        }
+                    }
+                }
+            });
+
+            let client = client::Client::new(Arc::new(FakeSystemClock::new()), http_client, cx);
+            // Set credentials - this is an authenticated client
+            client.cloud_client().set_credentials(1, "test".into());
+
+            language_model::init(client.clone(), cx);
+
+            let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+            let zeta = Zeta::global(&client, &user_store, cx);
+
+            let fs = FakeFs::new(cx.executor());
+            cx.executor().run_until_parked();
+            let _project = cx.background_executor().block(async {
+                fs.insert_tree(
+                    "/root",
+                    json!({
+                        "foo.md": "Hello!\nHow\nBye\n"
+                    }),
+                )
+                .await;
+                Project::test(fs, vec![path!("/root").as_ref()], cx).await
+            });
+
+            let buffer = _project
+                .update(cx, |project, cx| {
+                    let path = project.find_project_path(path!("root/foo.md"), cx).unwrap();
+                    project.open_buffer(path, cx)
+                });
+
+            let buffer = cx.executor().block(buffer).unwrap();
+            let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+            let position = snapshot.anchor_before(language::Point::new(1, 3));
+
+            let prediction_task = zeta.update(cx, |zeta, cx| {
+                zeta.request_prediction(&_project, &buffer, position, Default::default(), cx)
+            });
+
+            // Wait for the request to complete
+            let result = cx.executor().block(prediction_task);
+
+            // The prediction should succeed using custom URL
+            assert!(
+                result.is_ok(),
+                "Authenticated request with custom URL should succeed, got: {:?}",
+                result.err()
+            );
+
+            let requests = requests.lock();
+
+            // Verify NO token acquisition happened despite being authenticated
+            let token_requests: Vec<_> = requests
+                .iter()
+                .filter(|(path, _, _, _)| path == "/client/llm_tokens")
+                .collect();
+            assert_eq!(
+                token_requests.len(),
+                0,
+                "Should not attempt token acquisition even when authenticated if custom URL is set"
+            );
+
+            // Verify the prediction request went to custom URL
+            let predict_requests: Vec<_> = requests
+                .iter()
+                .filter(|(path, _, _, _)| path == "/predict")
+                .collect();
+            assert_eq!(
+                predict_requests.len(),
+                1,
+                "Should have made exactly one prediction request"
+            );
+
+            // Verify NO Authorization header on prediction request
+            let (_, _, has_auth, url) = &predict_requests[0];
+            assert!(
+                !has_auth,
+                "Prediction request should not have Authorization header even when authenticated"
+            );
+            assert!(
+                url.contains("localhost:8080"),
+                "Should use custom URL, got: {}",
+                url
+            );
+        });
+
+        // Cleanup
+        std::env::remove_var("ZED_PREDICT_EDITS_URL");
+    }
 }
