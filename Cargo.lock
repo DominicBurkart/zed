@@ -4767,7 +4767,7 @@ dependencies = [
  "serde_json",
  "serde_json_lenient",
  "settings",
- "sysinfo 0.37.2",
+ "sysinfo 0.37.0",
  "task",
  "tasks_ui",
  "telemetry",
@@ -14081,7 +14081,7 @@ dependencies = [
  "settings",
  "shellexpand 2.1.2",
  "smol",
- "sysinfo 0.37.2",
+ "sysinfo 0.37.0",
  "task",
  "theme",
  "thiserror 2.0.17",
@@ -16829,9 +16829,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.37.2"
+version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16607d5caffd1c07ce073528f9ed972d88db15dd44023fa57142963be3feb11f"
+checksum = "07cec4dc2d2e357ca1e610cfb07de2fa7a10fc3e9fe89f72545f3d244ea87753"
 dependencies = [
  "libc",
  "memchr",
@@ -16924,7 +16924,7 @@ dependencies = [
  "release_channel",
  "semver",
  "serde",
- "sysinfo 0.37.2",
+ "sysinfo 0.37.0",
 ]
 
 [[package]]
@@ -17128,7 +17128,7 @@ dependencies = [
  "serde_json",
  "settings",
  "smol",
- "sysinfo 0.37.2",
+ "sysinfo 0.37.0",
  "task",
  "theme",
  "thiserror 2.0.17",
@@ -21318,7 +21318,7 @@ dependencies = [
  "snippets_ui",
  "supermaven",
  "svg_preview",
- "sysinfo 0.37.2",
+ "sysinfo 0.37.0",
  "system_specs",
  "tab_switcher",
  "task",
