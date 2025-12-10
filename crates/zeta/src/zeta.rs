@@ -2915,7 +2915,8 @@ mod tests {
     use client::UserStore;
     use clock::FakeSystemClock;
     use cloud_llm_client::{
-        EditPredictionRejectReason, EditPredictionRejection, RejectEditPredictionsBody,
+        EditPredictionRejectReason, EditPredictionRejection, PredictEditsRequestTrigger,
+        PredictEditsResponse, RejectEditPredictionsBody,
     };
     use cloud_zeta2_prompt::retrieval_prompt::{SearchToolInput, SearchToolQuery};
     use futures::{
@@ -3859,6 +3860,348 @@ mod tests {
         assert_eq!(reject_request.rejections[1].request_id, "retry-2");
     }
 
+    #[gpui::test]
+    async fn test_unauthenticated_without_custom_url_blocks_prediction(cx: &mut TestAppContext) {
+        // Create unauthenticated test setup (no credentials set)
+        let zeta = cx.update(move |cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            zlog::init_test();
+
+            // Simple HTTP client that fails auth - won't actually be reached
+            let http_client = FakeHttpClient::create(|_req| async move {
+                Ok(Response::builder()
+                    .status(401)
+                    .body("Unauthorized".into())
+                    .unwrap())
+            });
+
+            let client = client::Client::new(Arc::new(FakeSystemClock::new()), http_client, cx);
+            // Note: NOT setting credentials - this is the unauthenticated case
+
+            language_model::init(client.clone(), cx);
+
+            let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+            Zeta::global(&client, &user_store, cx)
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "foo.md": "Hello!\nHow\nBye\n"
+            }),
+        )
+        .await;
+        let project = Project::test(fs, vec![path!("/root").as_ref()], cx).await;
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path(path!("root/foo.md"), cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let position = snapshot.anchor_before(language::Point::new(1, 3));
+
+        let result = zeta
+            .update(cx, |zeta, cx| {
+                zeta.request_prediction(
+                    &project,
+                    &buffer,
+                    position,
+                    PredictEditsRequestTrigger::Other,
+                    cx,
+                )
+            })
+            .await;
+
+        // Without authentication and without custom URL, this should fail
+        assert!(result.is_err());
+    }
+
+    #[gpui::test]
+    async fn test_unauthenticated_with_custom_url_allows_prediction(cx: &mut TestAppContext) {
+        // Set custom URL - with our fix, this should allow unauthenticated predictions
+        unsafe {
+            std::env::set_var("ZED_PREDICT_EDITS_URL", "http://localhost:8080/predict");
+        }
+
+        // Track whether predict endpoint was called
+        let predict_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let predict_called_clone = predict_called.clone();
+
+        let zeta = cx.update(move |cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            zlog::init_test();
+
+            let http_client = FakeHttpClient::create({
+                move |req| {
+                    let uri = req.uri().path().to_string();
+                    let predict_called = predict_called_clone.clone();
+                    async move {
+                        match uri.as_str() {
+                            "/predict" => {
+                                predict_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                                Ok(Response::builder()
+                                    .body(
+                                        serde_json::to_string(&PredictEditsResponse {
+                                            request_id: "test-123".to_string(),
+                                            output_excerpt: indoc::indoc! {r"
+                                                --- a/root/foo.md
+                                                +++ b/root/foo.md
+                                                @@ ... @@
+                                                 Hello!
+                                                -How
+                                                +How are you?
+                                                 Bye
+                                            "}
+                                            .to_string(),
+                                        })
+                                        .unwrap()
+                                        .into(),
+                                    )
+                                    .unwrap())
+                            }
+                            _ => {
+                                // Any other endpoint (like /client/llm_tokens) should fail
+                                // since we're unauthenticated
+                                Ok(Response::builder()
+                                    .status(401)
+                                    .body("Unauthorized".into())
+                                    .unwrap())
+                            }
+                        }
+                    }
+                }
+            });
+
+            let client = client::Client::new(Arc::new(FakeSystemClock::new()), http_client, cx);
+            // NOT setting credentials - this is the unauthenticated case
+
+            language_model::init(client.clone(), cx);
+
+            let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+            Zeta::global(&client, &user_store, cx)
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "foo.md": "Hello!\nHow\nBye\n"
+            }),
+        )
+        .await;
+        let project = Project::test(fs, vec![path!("/root").as_ref()], cx).await;
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path(path!("root/foo.md"), cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let position = snapshot.anchor_before(language::Point::new(1, 3));
+
+        // Trigger prediction request
+        zeta.update(cx, |zeta, cx| {
+            zeta.refresh_prediction_from_buffer(project.clone(), buffer.clone(), position, cx);
+        });
+
+        // Let async work complete
+        cx.run_until_parked();
+
+        // This assertion will FAIL on upstream code (red phase):
+        // Without our fix, the predict endpoint is never called because
+        // auth token acquisition fails first.
+        // With our fix, the predict endpoint SHOULD be called.
+        assert!(
+            predict_called.load(std::sync::atomic::Ordering::SeqCst),
+            "Expected predict endpoint to be called with custom URL even without authentication"
+        );
+
+        unsafe {
+            std::env::remove_var("ZED_PREDICT_EDITS_URL");
+        }
+    }
+
+    #[gpui::test]
+    async fn test_authenticated_without_custom_url_uses_token(cx: &mut TestAppContext) {
+        let (zeta, mut requests) = init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "foo.md": "Hello!\nHow\nBye\n"
+            }),
+        )
+        .await;
+        let project = Project::test(fs, vec![path!("/root").as_ref()], cx).await;
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path(path!("root/foo.md"), cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let position = snapshot.anchor_before(language::Point::new(1, 3));
+
+        zeta.update(cx, |zeta, cx| {
+            zeta.refresh_prediction_from_buffer(project.clone(), buffer.clone(), position, cx);
+        });
+
+        let (_, respond_tx) = requests.predict.next().await.unwrap();
+        respond_tx
+            .send(model_response(indoc! {r"
+                --- a/root/foo.md
+                +++ b/root/foo.md
+                @@ ... @@
+                 Hello!
+                -How
+                +How are you?
+                 Bye
+            "}))
+            .unwrap();
+
+        cx.run_until_parked();
+
+        zeta.read_with(cx, |zeta, cx| {
+            assert!(
+                zeta.current_prediction_for_buffer(&buffer, &project, cx)
+                    .is_some()
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_authenticated_user_with_custom_url_uses_token(cx: &mut TestAppContext) {
+        unsafe {
+            std::env::set_var("ZED_PREDICT_EDITS_URL", "http://localhost:8080/predict");
+        }
+
+        let (zeta, mut requests) = cx.update(move |cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            zlog::init_test();
+
+            let (predict_req_tx, predict_req_rx) = mpsc::unbounded();
+            let (reject_req_tx, reject_req_rx) = mpsc::unbounded();
+
+            let http_client = FakeHttpClient::create({
+                move |req| {
+                    let uri = req.uri().path().to_string();
+                    let mut body = req.into_body();
+                    let predict_req_tx = predict_req_tx.clone();
+                    let reject_req_tx = reject_req_tx.clone();
+                    async move {
+                        let resp = match uri.as_str() {
+                            "/client/llm_tokens" => serde_json::to_string(&json!({
+                                "token": "test"
+                            }))
+                            .unwrap(),
+                            "/predict_edits/raw" | "/predict" => {
+                                let mut buf = Vec::new();
+                                body.read_to_end(&mut buf).await.ok();
+                                let req = serde_json::from_slice(&buf).unwrap();
+
+                                let (res_tx, res_rx) = oneshot::channel();
+                                predict_req_tx.unbounded_send((req, res_tx)).unwrap();
+                                serde_json::to_string(&res_rx.await?).unwrap()
+                            }
+                            "/predict_edits/reject" => {
+                                let mut buf = Vec::new();
+                                body.read_to_end(&mut buf).await.ok();
+                                let req = serde_json::from_slice(&buf).unwrap();
+
+                                let (res_tx, res_rx) = oneshot::channel();
+                                reject_req_tx.unbounded_send((req, res_tx)).unwrap();
+                                serde_json::to_string(&res_rx.await?).unwrap()
+                            }
+                            _ => {
+                                panic!("Unexpected path: {}", uri)
+                            }
+                        };
+
+                        Ok(Response::builder().body(resp.into()).unwrap())
+                    }
+                }
+            });
+
+            let client = client::Client::new(Arc::new(FakeSystemClock::new()), http_client, cx);
+            client.cloud_client().set_credentials(1, "test".into());
+
+            language_model::init(client.clone(), cx);
+
+            let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+            let zeta = Zeta::global(&client, &user_store, cx);
+
+            (
+                zeta,
+                RequestChannels {
+                    predict: predict_req_rx,
+                    reject: reject_req_rx,
+                },
+            )
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "foo.md": "Hello!\nHow\nBye\n"
+            }),
+        )
+        .await;
+        let project = Project::test(fs, vec![path!("/root").as_ref()], cx).await;
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                let path = project.find_project_path(path!("root/foo.md"), cx).unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+        let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
+        let position = snapshot.anchor_before(language::Point::new(1, 3));
+
+        zeta.update(cx, |zeta, cx| {
+            zeta.refresh_prediction_from_buffer(project.clone(), buffer.clone(), position, cx);
+        });
+
+        let (_, respond_tx) = requests.predict.next().await.unwrap();
+        respond_tx
+            .send(model_response(indoc! {r"
+                --- a/root/foo.md
+                +++ b/root/foo.md
+                @@ ... @@
+                 Hello!
+                -How
+                +How are you?
+                 Bye
+            "}))
+            .unwrap();
+
+        cx.run_until_parked();
+
+        zeta.read_with(cx, |zeta, cx| {
+            assert!(
+                zeta.current_prediction_for_buffer(&buffer, &project, cx)
+                    .is_some()
+            );
+        });
+
+        unsafe {
+            std::env::remove_var("ZED_PREDICT_EDITS_URL");
+        }
+    }
+
     // Skipped until we start including diagnostics in prompt
     // #[gpui::test]
     // async fn test_request_diagnostics(cx: &mut TestAppContext) {
@@ -4014,7 +4357,7 @@ mod tests {
                                 "token": "test"
                             }))
                             .unwrap(),
-                            "/predict_edits/raw" => {
+                            "/predict_edits/raw" | "/predict" => {
                                 let mut buf = Vec::new();
                                 body.read_to_end(&mut buf).await.ok();
                                 let req = serde_json::from_slice(&buf).unwrap();
