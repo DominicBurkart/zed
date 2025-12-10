@@ -2001,18 +2001,27 @@ impl Zeta {
         Res: DeserializeOwned,
     {
         let http_client = client.http_client();
-        let mut token = llm_token.acquire(&client).await?;
+        // Custom URL: auth optional (graceful fallback for self-hosted)
+        let has_custom_url = PREDICT_EDITS_URL.is_some();
+        let mut token = if has_custom_url {
+            llm_token.acquire(&client).await.ok()
+        } else {
+            Some(llm_token.acquire(&client).await?)
+        };
         let mut did_retry = false;
 
         loop {
-            let request_builder = http_client::Request::builder().method(Method::POST);
+            let mut request_builder = http_client::Request::builder()
+                .method(Method::POST)
+                .header("Content-Type", "application/json")
+                .header(ZED_VERSION_HEADER_NAME, app_version.to_string());
 
-            let request = build(
-                request_builder
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", format!("Bearer {}", token))
-                    .header(ZED_VERSION_HEADER_NAME, app_version.to_string()),
-            )?;
+            if let Some(ref token_value) = token {
+                request_builder =
+                    request_builder.header("Authorization", format!("Bearer {}", token_value));
+            }
+
+            let request = build(request_builder)?;
 
             let mut response = http_client.send(request).await?;
 
@@ -2036,13 +2045,14 @@ impl Zeta {
                 response.body_mut().read_to_end(&mut body).await?;
                 return Ok((serde_json::from_slice(&body)?, usage));
             } else if !did_retry
+                && token.is_some()
                 && response
                     .headers()
                     .get(EXPIRED_LLM_TOKEN_HEADER_NAME)
                     .is_some()
             {
                 did_retry = true;
-                token = llm_token.refresh(&client).await?;
+                token = Some(llm_token.refresh(&client).await?);
             } else {
                 let mut body = String::new();
                 response.body_mut().read_to_string(&mut body).await?;
